@@ -1,0 +1,2 @@
+Hello this is a test file for the SRFT protocol.
+Testing reliable file transfer.

@@ -1,101 +1,62 @@
 import socket
-from src.srft_packet import SRFTPacket, DATA, ACK
+from src.srft_packet import SRFTPacket, ACK
 
-# Network header sizes
-IP_HEADER_SIZE = 20
-UDP_HEADER_SIZE = 8
+
+def create_receive_socket(port):
+    """Raw UDP socket that CAN receive — used by client to receive ACKs."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_UDP)
+    sock.bind(("0.0.0.0", port))  # bind to all interfaces on the specified port
+    return sock
 
 
 def extract_srft_packet(raw_packet):
-    """
-    Extract the SRFT packet from a received raw packet.
-    Removes the IPv4 and UDP headers.
-    """
-
-    srft_data = raw_packet[IP_HEADER_SIZE + UDP_HEADER_SIZE:]
-
+    ip_header_length = (raw_packet[0] & 0x0F) * 4
+    udp_header_size = 8
+    srft_data = raw_packet[ip_header_length + udp_header_size:]
     return SRFTPacket.from_bytes(srft_data)
 
 
-def wait_for_ack(sock, expected_ack, timeout=2):
-    """
-    Wait for an ACK packet.
-
-    Parameters:
-    sock           -> socket used to receive packets
-    expected_ack   -> sequence number we expect acknowledgement for
-    timeout        -> seconds to wait before retransmitting
-
-    Returns:
-    True  -> correct ACK received
-    False -> timeout occurred
-    """
-
-    sock.settimeout(timeout)
-
-    try:
-        raw_packet, addr = sock.recvfrom(65535)
-
-        srft_packet = extract_srft_packet(raw_packet)
-
-        if srft_packet.flags == ACK and srft_packet.ack_num == expected_ack:
-            print("ACK received for packet:", expected_ack)
-            return True
-
-    except socket.timeout:
-        print("Timeout waiting for ACK")
-
-    return False
+def extract_dst_port(raw_packet):
+    """Read the destination port from the UDP header."""
+    ip_header_length = (raw_packet[0] & 0x0F) * 4
+    # UDP header: src_port (2), dst_port (2), length (2), checksum (2)
+    dst_port = (raw_packet[ip_header_length + 2] << 8) + raw_packet[ip_header_length + 3]
+    return dst_port
 
 
-def reliable_send(sock, packet_bytes, seq_num, dst_ip):
-    """
-    Send a packet reliably using Stop-and-Wait protocol.
-
-    The sender keeps retransmitting until the correct ACK is received.
-    """
+def wait_for_ack(recv_sock, expected_ack, our_port, timeout=2):
+    recv_sock.settimeout(timeout)
 
     while True:
+        try:
+            raw_packet, addr = recv_sock.recvfrom(65535)
 
+            dst_port = extract_dst_port(raw_packet)
+            if dst_port != our_port:
+                continue
+
+            srft_packet = extract_srft_packet(raw_packet)
+
+            if srft_packet.flags == ACK and srft_packet.ack_num == expected_ack:
+                print("ACK received for packet:", expected_ack)
+                return True
+
+        except ValueError:
+            continue
+
+        except (socket.timeout, TimeoutError):  # <-- THIS LINE CHANGED
+            print("Timeout waiting for ACK")
+            return False
+
+
+def reliable_send(send_sock, recv_sock, packet_bytes, seq_num, dst_ip, our_port=5000):
+    """Stop-and-Wait reliable transmission."""
+    while True:
         print("Sending packet seq:", seq_num)
+        send_sock.sendto(packet_bytes, (dst_ip, 0))
 
-        sock.sendto(packet_bytes, (dst_ip, 0))
-
-        ack_received = wait_for_ack(sock, seq_num)
-
-        if ack_received:
+        if wait_for_ack(recv_sock, seq_num, our_port):
             print("Packet delivered successfully\n")
             break
 
         print("Retransmitting packet...\n")
-
-
-def send_file(sock, dst_ip, file_path, chunk_size=1024):
-    """
-    Send a file reliably using Stop-and-Wait.
-    """
-
-    seq_num = 1
-
-    with open(file_path, "rb") as file:
-
-        while True:
-
-            chunk = file.read(chunk_size)
-
-            if not chunk:
-                break
-
-            packet = SRFTPacket(
-                seq_num=seq_num,
-                ack_num=0,
-                flags=DATA,
-                window=5,
-                payload=chunk
-            )
-
-            packet_bytes = packet.to_bytes()
-
-            reliable_send(sock, packet_bytes, seq_num, dst_ip)
-
-            seq_num += 1

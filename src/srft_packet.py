@@ -5,6 +5,9 @@ DATA = 1
 ACK = 2
 FIN = 3
 
+# Magic identifier for our protocol
+MAGIC = b"SRFT"
+
 # Header structure
 HEADER_FORMAT = "!IIBHH"
 HEADER_SIZE = struct.calcsize(HEADER_FORMAT)
@@ -32,11 +35,15 @@ class SRFTPacket:
             payload_length
         )
 
-        packet = header + self.payload
-        return packet
+        return MAGIC + header + self.payload
 
     @classmethod
     def from_bytes(cls, data):
+
+        if data[:4] != MAGIC:
+            raise ValueError("Not SRFT packet")
+
+        data = data[4:]
 
         header = data[:HEADER_SIZE]
 
@@ -45,9 +52,6 @@ class SRFTPacket:
             header
         )
 
-        payload_start = HEADER_SIZE
-        payload_end = HEADER_SIZE + payload_length
-
-        payload = data[payload_start:payload_end]
+        payload = data[HEADER_SIZE:HEADER_SIZE + payload_length]
 
         return cls(seq_num, ack_num, flags, window, payload)
