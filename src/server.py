@@ -1,6 +1,5 @@
 import socket
-from src.srft_packet import SRFTPacket, DATA
-
+from src.srft_packet import SRFTPacket, DATA, ACK
 
 def create_receive_socket(port):
 
@@ -14,8 +13,23 @@ def create_receive_socket(port):
 
     return sock
 
+def send_ack(sock, addr, seq_num):
 
-def process_packet(packet):
+    ack_packet = SRFTPacket(
+        seq_num=0,
+        ack_num=seq_num,
+        flags=ACK,
+        window=5,
+        payload=b""
+    )
+
+    raw_packet = ack_packet.to_bytes()
+
+    sock.sendto(raw_packet, addr)
+
+    print("Sent ACK for sequence:", seq_num)
+
+def process_packet(packet, sock, addr):
 
     ip_header_size = 20
     udp_header_size = 8
@@ -30,6 +44,7 @@ def process_packet(packet):
         print("Sequence:", srft_packet.seq_num)
         print("Payload:", srft_packet.payload)
 
+        send_ack(sock, addr, srft_packet.seq_num)
 
 def receive_packets(sock):
 
@@ -39,8 +54,7 @@ def receive_packets(sock):
 
         print("Packet received from:", addr)
 
-        process_packet(packet)
-
+        process_packet(packet, sock, addr)
 
 if __name__ == "__main__":
 
