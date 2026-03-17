@@ -15,6 +15,6 @@
   },
   "security": {
     "enabled": true,
-    "psk": "cs5700-srft-secure-key-kole-2026!!"
+    "psk": "your-32-byte-secret-key-here!!!!"
 }
 }
