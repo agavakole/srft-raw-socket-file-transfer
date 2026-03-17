@@ -6,6 +6,22 @@ from src.srft_packet import TYPE_DATA, TYPE_FIN, TYPE_REQ, TYPE_ACK, pack_packet
 from src.ip_header import build_ipv4_header
 from src.udp_header import build_udp_header
 from src.raw_socket import create_raw_socket
+from src.security import (
+    derive_session_key,
+    encrypt_payload,
+    build_aad,
+    generate_nonce,
+    compute_sha256
+)
+from src.handshake import (
+    build_client_hello,
+    parse_server_hello,
+    HELLO_CLIENT,
+    HELLO_SERVER
+)
+
+# Handshake timeout
+HANDSHAKE_TIMEOUT = 5
 
 
 class SRFTClient:
@@ -21,17 +37,26 @@ class SRFTClient:
         self.window_size = cfg.transfer.send_window_packets
         self.rto = cfg.timers.rto_ms / 1000
 
+        # security config
+        self.security_enabled = getattr(cfg.security, "enabled", False)
+        psk_str = getattr(cfg.security, "psk", "")
+        self.psk = psk_str.encode() if psk_str else b""
+
+        # session state — set after handshake
+        self.session_id = None
+        self.enc_key = None
+
         # raw sockets
         self.send_socket = create_raw_socket()
         self.recv_socket = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_UDP)
         self.recv_socket.bind(("0.0.0.0", self.client_port))
 
         # sliding window state
-        self.base = 1           # oldest unACKed seq
-        self.next_seq = 1       # next seq to send
-        self.unacked = {}       # seq -> (packet_bytes, send_time)
+        self.base = 1
+        self.next_seq = 1
+        self.unacked = {}
         self.lock = threading.Lock()
-        self.all_sent = False   # true when all chunks queued
+        self.all_sent = False
 
         # stats
         self.packets_sent = 0
@@ -44,6 +69,72 @@ class SRFTClient:
         ip_header = build_ipv4_header(self.client_ip, dst_ip, len(udp_packet))
         full_packet = ip_header + udp_packet
         self.send_socket.sendto(full_packet, (dst_ip, 0))
+
+    def extract_srft_data(self, raw_packet):
+        """Extract SRFT payload from raw packet."""
+        ip_header_length = (raw_packet[0] & 0x0F) * 4
+        dst_port = (raw_packet[ip_header_length + 2] << 8) + raw_packet[ip_header_length + 3]
+        if dst_port != self.client_port:
+            return None
+        return raw_packet[ip_header_length + 8:]
+
+    # -------------------------------------------------
+    # Handshake
+    # -------------------------------------------------
+
+    def do_handshake(self) -> bool:
+        """
+        Perform security handshake with server.
+        1. Send ClientHello with nonce + HMAC
+        2. Receive ServerHello with nonce + session_id + HMAC
+        3. Derive session encryption key from PSK + both nonces
+        Returns True if handshake succeeded, False if failed.
+        """
+        print("[CLIENT] Starting security handshake...")
+
+        # build and send ClientHello
+        client_hello, client_nonce = build_client_hello(self.psk)
+        self.send_udp_packet(
+            self.server_ip,
+            self.client_port,
+            self.server_port,
+            client_hello
+        )
+        print("[CLIENT] Sent ClientHello")
+
+        # wait for ServerHello
+        self.recv_socket.settimeout(HANDSHAKE_TIMEOUT)
+        try:
+            while True:
+                raw_packet, _ = self.recv_socket.recvfrom(65535)
+                srft_data = self.extract_srft_data(raw_packet)
+                if srft_data is None:
+                    continue
+
+                # check if this is a handshake packet
+                if len(srft_data) > 0 and srft_data[0] == HELLO_SERVER:
+                    try:
+                        server_nonce, session_id = parse_server_hello(
+                            srft_data, self.psk, client_nonce
+                        )
+                        # derive session encryption key
+                        self.enc_key = derive_session_key(
+                            self.psk, client_nonce, server_nonce
+                        )
+                        self.session_id = session_id
+                        print(f"[CLIENT] Handshake SUCCESS — session: {session_id.hex()}")
+                        return True
+                    except ValueError as e:
+                        print(f"[CLIENT] Handshake FAILED: {e}")
+                        return False
+
+        except (socket.timeout, TimeoutError):
+            print("[CLIENT] Handshake FAILED — timeout waiting for ServerHello")
+            return False
+
+    # -------------------------------------------------
+    # File Request
+    # -------------------------------------------------
 
     def send_request(self):
         """Send filename request to server before transfer."""
@@ -63,31 +154,23 @@ class SRFTClient:
         print(f"[CLIENT] Requested file: {self.filename}")
         time.sleep(0.1)
 
-    def compute_md5(self, filepath):
-        """Compute MD5 hash of file."""
-        h = hashlib.md5()
-        with open(filepath, "rb") as f:
-            for chunk in iter(lambda: f.read(4096), b""):
-                h.update(chunk)
-        return h.hexdigest()
+    # -------------------------------------------------
+    # ACK Receiver Thread
+    # -------------------------------------------------
 
     def ack_receiver(self):
         """
         Thread: receives cumulative ACKs from server.
-        A cumulative ACK of N means all packets up to N were received.
-        Slides the window forward.
+        Slides the window forward on each ACK received.
         """
         self.recv_socket.settimeout(self.rto)
         while True:
             try:
                 raw_packet, _ = self.recv_socket.recvfrom(65535)
-
-                ip_header_length = (raw_packet[0] & 0x0F) * 4
-                dst_port = (raw_packet[ip_header_length + 2] << 8) + raw_packet[ip_header_length + 3]
-                if dst_port != self.client_port:
+                srft_data = self.extract_srft_data(raw_packet)
+                if srft_data is None:
                     continue
 
-                srft_data = raw_packet[ip_header_length + 8:]
                 info, _ = unpack_packet(srft_data)
 
                 if info["type"] == TYPE_ACK:
@@ -95,20 +178,17 @@ class SRFTClient:
                     print(f"[CLIENT] Cumulative ACK received: {ack_num}")
 
                     with self.lock:
-                        # slide window — remove all ACKed packets
                         for seq in list(self.unacked.keys()):
                             if seq <= ack_num:
                                 del self.unacked[seq]
                         self.base = ack_num + 1
 
-                    # if all sent and all ACKed we are done
                     if self.all_sent and not self.unacked:
                         return
 
             except ValueError:
                 continue
             except (socket.timeout, TimeoutError):
-                # check for retransmissions on timeout
                 self._retransmit_unacked()
                 if self.all_sent and not self.unacked:
                     return
@@ -129,8 +209,20 @@ class SRFTClient:
                     self.unacked[seq] = (packet_bytes, now)
                     self.packets_retransmitted += 1
 
+    # -------------------------------------------------
+    # File Transfer
+    # -------------------------------------------------
+
+    def compute_md5(self, filepath):
+        """Compute MD5 hash of file."""
+        h = hashlib.md5()
+        with open(filepath, "rb") as f:
+            for chunk in iter(lambda: f.read(4096), b""):
+                h.update(chunk)
+        return h.hexdigest()
+
     def send_file(self):
-        """Send file using sliding window with cumulative ACKs."""
+        """Send file using sliding window. Encrypts if security enabled."""
         md5 = self.compute_md5(self.filename)
         print(f"[CLIENT] MD5 of file to send: {md5}")
 
@@ -152,11 +244,21 @@ class SRFTClient:
                 if not chunk:
                     break
 
+                # encrypt chunk if security enabled
+                if self.security_enabled and self.enc_key:
+                    nonce = generate_nonce()
+                    aad = build_aad(self.session_id, self.next_seq, 0, TYPE_DATA)
+                    encrypted_chunk = encrypt_payload(self.enc_key, nonce, chunk, aad)
+                    # prepend nonce so server can decrypt
+                    payload = nonce + encrypted_chunk
+                else:
+                    payload = chunk
+
                 srft_bytes = pack_packet(
                     msg_type=TYPE_DATA,
                     seq=self.next_seq,
                     ack=0,
-                    payload=chunk,
+                    payload=payload,
                     window=self.window_size
                 )
 
@@ -177,12 +279,22 @@ class SRFTClient:
         self.all_sent = True
         ack_thread.join(timeout=30)
 
+        # send SHA-256 digest for end-to-end verification
+        if self.security_enabled and self.enc_key:
+            sha256_digest = compute_sha256(self.filename)
+            nonce = generate_nonce()
+            aad = build_aad(self.session_id, self.next_seq, 0, TYPE_FIN)
+            encrypted_digest = encrypt_payload(self.enc_key, nonce, sha256_digest, aad)
+            fin_payload = nonce + encrypted_digest
+        else:
+            fin_payload = b""
+
         # send FIN
         fin_bytes = pack_packet(
             msg_type=TYPE_FIN,
             seq=self.next_seq,
             ack=0,
-            payload=b"",
+            payload=fin_payload,
             window=0
         )
         self.send_udp_packet(
@@ -198,11 +310,23 @@ class SRFTClient:
         print(f"Packets sent: {self.packets_sent}")
         print(f"Packets retransmitted: {self.packets_retransmitted}")
         print(f"MD5: {md5}")
+        if self.security_enabled:
+            print(f"Security: enabled (PSK + AES-GCM)")
+
+    # -------------------------------------------------
+    # Start
+    # -------------------------------------------------
 
     def start(self):
-        """Start the client — send request then transfer file."""
+        """Start client — handshake if security enabled, then transfer."""
         print(f"[CLIENT] Running on {self.client_ip}:{self.client_port}")
         print(f"[CLIENT] Talking to server {self.server_ip}:{self.server_port}")
+
+        if self.security_enabled:
+            if not self.do_handshake():
+                print("[CLIENT] Aborting — handshake failed")
+                return
+
         self.send_request()
         self.send_file()
 

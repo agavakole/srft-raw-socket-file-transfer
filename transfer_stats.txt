@@ -1,5 +1,10 @@
 Name of the transferred file: file.txt
 Size of the transferred file: 81 bytes
 The number of packets received from the client: 1
-The time duration of the file transfer (hh:min:ss): 00:00:00
+The time duration of the file transfer (hh:min:ss): 00:00:02
+Security enabled (PSK + AEAD): Yes
+Handshake status: Success
+AEAD authentication failures: 1
+Replay drops: 0
+SHA-256 match: Yes
 MD5 hash of received file: 5054dcab3afbf4651ce9326a9a3322b9

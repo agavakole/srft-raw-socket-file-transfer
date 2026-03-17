@@ -22,12 +22,17 @@ def main():
         "--file",
         help="Filename to transfer (client mode only)"
     )
+    parser.add_argument(
+        "--attack",
+        choices=["tamper", "replay", "inject"],
+        help="Enable attack mode for security testing"
+    )
 
     args = parser.parse_args()
     cfg = load_config(args.config)
 
     if args.mode == "server":
-        run_server(cfg)
+        run_server(cfg, attack=args.attack)
     elif args.mode == "client":
         if not args.file:
             parser.error("--file is required in client mode")
