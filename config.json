@@ -1,0 +1,17 @@
+{
+  "network": {
+    "client_ip": "127.0.0.1",
+    "server_ip": "127.0.0.1",
+    "client_port": 5000,
+    "server_port": 6000
+  },
+  "transfer": {
+    "chunk_size": 1024,
+    "send_window_packets": 8
+  },
+  "timers": {
+    "rto_ms": 2000,
+    "ack_interval_ms": 50
+  },
+  "security": {}
+}

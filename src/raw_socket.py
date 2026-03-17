@@ -15,9 +15,3 @@ def create_raw_socket():
     return sock
 
 
-def send_packet(sock, packet, dst_ip):
-    """
-    Send a raw packet to the destination.
-    """
-
-    sock.sendto(packet, (dst_ip, 0))
